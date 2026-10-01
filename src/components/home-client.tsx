@@ -60,6 +60,10 @@ export function HomeClient({
           >
             {fenToSymbol(cumulative.total.balanceFen)}
           </p>
+          {/* 固定说明：截至指定日期的本科期间总余额 */}
+          <p className="mt-2.5 text-sm font-medium text-white/80 sm:text-[15px]">
+            截至 2026.9.30，本科期间总余额为 <span className="num font-semibold text-white">47702.41</span> 元
+          </p>
           <div className="mt-4 grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
             <div className="rounded-xl bg-white/10 px-3 py-2">
               <p className="text-white/60">累计收入</p>
