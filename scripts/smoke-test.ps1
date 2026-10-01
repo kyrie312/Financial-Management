@@ -36,7 +36,8 @@ $failed = 0
 $createdIds = @()
 
 Section "登录"
-$login = Api "Post" "/api/auth/login" @{ password = "admin123" }
+$password = if ($env:SMOKE_PASSWORD) { $env:SMOKE_PASSWORD } else { "admin123" }
+$login = Api "Post" "/api/auth/login" @{ password = $password }
 Check ($login.ok -eq $true) "使用密码登录成功"
 
 # 开发预览旁路（仅本机 dev 生效）会放行未登录请求，此时跳过这一项

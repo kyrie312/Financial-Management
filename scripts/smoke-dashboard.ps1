@@ -31,7 +31,8 @@ $now = Get-Date
 $monthKey = "{0}-{1:D2}" -f $now.Year, $now.Month
 
 Section "登录"
-Check ((Api "Post" "/api/auth/login" @{ password = $env:SMOKE_PASSWORD ?? "Mayikun20040312" }).ok -eq $true) "登录成功"
+$password = if ($env:SMOKE_PASSWORD) { $env:SMOKE_PASSWORD } else { "admin123" }
+Check ((Api "Post" "/api/auth/login" @{ password = $password }).ok -eq $true) "登录成功"
 
 Section "记录基线"
 $before = (Api "Get" "/api/summary?month=all").summary

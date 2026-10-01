@@ -98,7 +98,8 @@ function RestoreMonthRecords($type, $subId, $rows) {
 }
 
 Section "登录"
-Check ((Api "Post" "/api/auth/login" @{ password = "admin123" }).ok -eq $true) "登录成功"
+$password = if ($env:SMOKE_PASSWORD) { $env:SMOKE_PASSWORD } else { "admin123" }
+Check ((Api "Post" "/api/auth/login" @{ password = $password }).ok -eq $true) "登录成功"
 
 $life = (Api "Get" "/api/summary?month=all").categories | Where-Object { $_.id -eq "life" }
 $meal = $life.subcategories[0]
