@@ -231,8 +231,12 @@ export async function getRecordView(id: number): Promise<RecordView | null> {
 
 
 /** 一次查询同时取回：分板块收支汇总、7 个细分类型开销、出现过的月份
- *  column 是「分桶表达式」：传 '0' 表示只要累计（bucket 恒为 0）；
- *  同时要累计和某个区间时可以一次查询算出两个桶，避免两次跨区域往返。
+ *
+ * 分桶规则（重要）：
+ *   桶 '0' = 累计：**每条记录都算进去**
+ *   桶 '1' = 指定区间（如本月）：记录落在区间内时**额外**算一份
+ * 所以区间内的记录会同时出现在两个桶里，这样「累计」和「本月」才能各自独立成立。
+ * （早期版本误把两个桶做成互斥的，导致本月记的账在累计里看不到。）
  */
 async function snapshotFor(
   from: number | null,
@@ -247,23 +251,28 @@ async function snapshotFor(
   const [tree, rows] = await Promise.all([
     loadCategoryTree(),
     query<{ kind: string; key: string; type: string | null; s: number }>(
-      `WITH scope AS (
-         SELECT *, ${column} AS bucket FROM records
+      `WITH scoped AS (
+         SELECT *, (${column}) AS in_range FROM records
           WHERE (?::bigint IS NULL OR occurred_at >= ?)
             AND (?::bigint IS NULL OR occurred_at < ?)
+       ),
+       bucketed AS (
+         SELECT *, '0' AS bucket FROM scoped
+         UNION ALL
+         SELECT *, '1' AS bucket FROM scoped WHERE in_range
        )
        SELECT 'category' AS kind, bucket || '|' || category_id AS key, type, SUM(amount_fen) AS s
-         FROM scope GROUP BY bucket, category_id, type
+         FROM bucketed GROUP BY bucket, category_id, type
        UNION ALL
        SELECT 'subcategory' AS kind, bucket || '|' || subcategory_id::text AS key,
               NULL AS type, SUM(amount_fen) AS s
-         FROM scope WHERE type = 'expense' AND subcategory_id IS NOT NULL
+         FROM bucketed WHERE type = 'expense' AND subcategory_id IS NOT NULL
         GROUP BY bucket, subcategory_id
        UNION ALL
        SELECT 'month' AS kind,
               to_char(to_timestamp(occurred_at / 1000.0), 'YYYY-MM') AS key,
               NULL AS type, NULL AS s
-         FROM scope GROUP BY 2`,
+         FROM bucketed WHERE bucket = '0' GROUP BY 2`,
       [from, from, to, to],
     ),
   ]);
@@ -355,12 +364,12 @@ export async function loadDashboard(
 ): Promise<{ cumulative: OverallSummary; month: OverallSummary; monthKeys: MonthKey[] }> {
   const hasRange = typeof from === "number" && typeof to === "number";
   const column = hasRange
-    ? `CASE WHEN occurred_at >= ${Number(from)} AND occurred_at < ${Number(to)} THEN '1' ELSE '0' END`
-    : "0";
+    ? `occurred_at >= ${Number(from)} AND occurred_at < ${Number(to)}`
+    : "true";
   const snapshot = await snapshotFor(from, to, column);
   return {
     cumulative: snapshotToSummary(snapshot, "0", true),
-    month: snapshotToSummary(snapshot, "1", true),
+    month: hasRange ? snapshotToSummary(snapshot, "1", true) : snapshotToSummary(snapshot, "0", true),
     monthKeys: snapshot.monthKeys,
   };
 }
@@ -370,7 +379,7 @@ export async function summaryForRange(
   to: number | null,
   options: { includeSubcategories?: boolean } = {},
 ): Promise<OverallSummary> {
-  const snapshot = await snapshotFor(from, to, "0");
+  const snapshot = await snapshotFor(from, to, "false");
   return snapshotToSummary(snapshot, "0", options.includeSubcategories !== false);
 }
 
