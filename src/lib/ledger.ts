@@ -80,20 +80,55 @@ function emptyBreakdown(): AmountBreakdown {
 
 /** ---------- 类别 ---------- */
 
+/**
+ * 一次查询取回「板块 + 细分类型」。
+ * 类别是静态数据（只有 3 + 7 行），所以在进程内缓存，避免每次页面加载都发一次往返。
+ * 跨区域数据库每次往返约 200ms，这一项对响应速度影响很明显。
+ */
+let categoryTreeCache: {
+  categories: CategoryView[];
+  subNames: Map<number, string>;
+} | null = null;
+
+async function loadCategoryTree(): Promise<{ categories: CategoryView[]; subNames: Map<number, string> }> {
+  if (categoryTreeCache) return categoryTreeCache;
+
+  const rows = await query<{
+    id: CategoryId;
+    name: string;
+    sort: number;
+    sub_id: number | null;
+    sub_name: string | null;
+    sub_sort: number | null;
+  }>(
+    `SELECT c.id, c.name, c.sort,
+            s.id AS sub_id, s.name AS sub_name, s.sort AS sub_sort
+       FROM categories c
+       LEFT JOIN subcategories s ON s.category_id = c.id
+      ORDER BY c.sort ASC, c.id ASC, s.sort ASC, s.id ASC`,
+  );
+
+  const categories: CategoryView[] = [];
+  const subNames = new Map<number, string>();
+  for (const row of rows) {
+    let category = categories.find((item) => item.id === row.id);
+    if (!category) {
+      category = { id: row.id, name: row.name, subcategories: [] };
+      categories.push(category);
+    }
+    if (row.sub_id !== null && row.sub_name !== null) {
+      const subId = Number(row.sub_id);
+      category.subcategories.push({ id: subId, name: row.sub_name });
+      subNames.set(subId, row.sub_name);
+    }
+  }
+
+  categoryTreeCache = { categories, subNames };
+  return categoryTreeCache;
+}
+
 export async function listCategories(): Promise<CategoryView[]> {
-  const categories = await query<CategoryRow>(
-    "SELECT id, name, sort FROM categories ORDER BY sort ASC, id ASC",
-  );
-  const subs = await query<SubcategoryRow>(
-    "SELECT id, category_id, name, sort FROM subcategories ORDER BY category_id ASC, sort ASC, id ASC",
-  );
-  return categories.map((category) => ({
-    id: category.id,
-    name: category.name,
-    subcategories: subs
-      .filter((sub) => sub.category_id === category.id)
-      .map((sub) => ({ id: Number(sub.id), name: sub.name })),
-  }));
+  return (await loadCategoryTree()).categories;
 }
 
 async function isSubcategoryOf(subcategoryId: number, categoryId: CategoryId): Promise<boolean> {
@@ -102,11 +137,6 @@ async function isSubcategoryOf(subcategoryId: number, categoryId: CategoryId): P
     [subcategoryId, categoryId],
   );
   return Boolean(row);
-}
-
-async function subcategoryNameMap(): Promise<Map<number, string>> {
-  const subs = await query<SubcategoryRow>("SELECT id, category_id, name, sort FROM subcategories");
-  return new Map(subs.map((sub) => [Number(sub.id), sub.name]));
 }
 
 function mapRecord(row: RecordRow, subNames: Map<number, string>): RecordView {
@@ -172,78 +202,167 @@ export async function listRecords(input: ListRecordsInput): Promise<RecordPage> 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const page = Math.min(Math.max(input.page ?? 1, 1), totalPages);
 
-  const rows = await query<RecordRow>(
-    `SELECT * ${base} ORDER BY occurred_at DESC, id DESC LIMIT ? OFFSET ?`,
-    [...params, pageSize, (page - 1) * pageSize],
-  );
+  const [rows, tree] = await Promise.all([
+    query<RecordRow>(`SELECT * ${base} ORDER BY occurred_at DESC, id DESC LIMIT ? OFFSET ?`, [
+      ...params,
+      pageSize,
+      (page - 1) * pageSize,
+    ]),
+    loadCategoryTree(),
+  ]);
 
-  const subNames = await subcategoryNameMap();
-  return { items: rows.map((row) => mapRecord(row, subNames)), page, pageSize, total, totalPages };
+  return {
+    items: rows.map((row) => mapRecord(row, tree.subNames)),
+    page,
+    pageSize,
+    total,
+    totalPages,
+  };
 }
 
 export async function getRecordView(id: number): Promise<RecordView | null> {
   const row = await queryOne<RecordRow>("SELECT * FROM records WHERE id = ?", [id]);
   if (!row) return null;
-  return mapRecord(row, await subcategoryNameMap());
+  const tree = await loadCategoryTree();
+  return mapRecord(row, tree.subNames);
 }
 
-/** ---------- 统计汇总 ---------- */
+/** ---------- 统计汇总（合并成一次查询，减少跨区域往返） ---------- */
 
-async function sumByCategory(
+
+/** 一次查询同时取回：分板块收支汇总、7 个细分类型开销、出现过的月份
+ *  column 是「分桶表达式」：传 '0' 表示只要累计（bucket 恒为 0）；
+ *  同时要累计和某个区间时可以一次查询算出两个桶，避免两次跨区域往返。
+ */
+async function snapshotFor(
   from: number | null,
   to: number | null,
-): Promise<Map<CategoryId, AmountBreakdown>> {
-  const where: string[] = [];
-  const params: SqlValue[] = [];
-  if (typeof from === "number") {
-    where.push("occurred_at >= ?");
-    params.push(from);
-  }
-  if (typeof to === "number") {
-    where.push("occurred_at < ?");
-    params.push(to);
-  }
-  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  column: string,
+): Promise<{
+  byCategory: Array<{ id: CategoryId; bucket: string; entry: AmountBreakdown }>;
+  bySubcategory: Array<{ id: number; name: string; bucket: string; expenseFen: number }>;
+  monthKeys: MonthKey[];
+  totalByBucket: Map<string, AmountBreakdown>;
+}> {
+  const [tree, rows] = await Promise.all([
+    loadCategoryTree(),
+    query<{ kind: string; key: string; type: string | null; s: number }>(
+      `WITH scope AS (
+         SELECT *, ${column} AS bucket FROM records
+          WHERE (?::bigint IS NULL OR occurred_at >= ?)
+            AND (?::bigint IS NULL OR occurred_at < ?)
+       )
+       SELECT 'category' AS kind, bucket || '|' || category_id AS key, type, SUM(amount_fen) AS s
+         FROM scope GROUP BY bucket, category_id, type
+       UNION ALL
+       SELECT 'subcategory' AS kind, bucket || '|' || subcategory_id::text AS key,
+              NULL AS type, SUM(amount_fen) AS s
+         FROM scope WHERE type = 'expense' AND subcategory_id IS NOT NULL
+        GROUP BY bucket, subcategory_id
+       UNION ALL
+       SELECT 'month' AS kind,
+              to_char(to_timestamp(occurred_at / 1000.0), 'YYYY-MM') AS key,
+              NULL AS type, NULL AS s
+         FROM scope GROUP BY 2`,
+      [from, from, to, to],
+    ),
+  ]);
 
-  const rows = await query<{ category_id: CategoryId; type: RecordType; s: number }>(
-    `SELECT category_id, type, SUM(amount_fen) AS s FROM records ${whereSql}
-     GROUP BY category_id, type`,
-    params,
-  );
+  const sums = new Map<string, AmountBreakdown>();
+  const subSums = new Map<string, number>();
+  const monthKeys = new Set<MonthKey>();
 
-  const map = new Map<CategoryId, AmountBreakdown>();
   for (const row of rows) {
-    const entry = map.get(row.category_id) ?? emptyBreakdown();
-    if (row.type === "income") entry.incomeFen += Number(row.s ?? 0);
-    else entry.expenseFen += Number(row.s ?? 0);
-    map.set(row.category_id, entry);
+    if (row.kind === "category") {
+      const entry = sums.get(row.key) ?? emptyBreakdown();
+      if (row.type === "income") entry.incomeFen += Number(row.s ?? 0);
+      else entry.expenseFen += Number(row.s ?? 0);
+      sums.set(row.key, entry);
+    } else if (row.kind === "subcategory") {
+      subSums.set(row.key, Number(row.s ?? 0));
+    } else if (row.kind === "month") {
+      monthKeys.add(row.key as MonthKey);
+    }
   }
-  for (const entry of map.values()) {
+
+  const buckets = new Set<string>();
+  const byCategory: Array<{ id: CategoryId; bucket: string; entry: AmountBreakdown }> = [];
+  for (const [key, entry] of sums) {
+    const [bucket, categoryId] = key.split("|");
+    buckets.add(bucket);
     entry.balanceFen = entry.incomeFen - entry.expenseFen;
+    byCategory.push({ id: categoryId as CategoryId, bucket, entry });
   }
-  return map;
+
+  const totalByBucket = new Map<string, AmountBreakdown>();
+  for (const bucket of buckets) {
+    const total = emptyBreakdown();
+    for (const item of byCategory) {
+      if (item.bucket !== bucket) continue;
+      total.incomeFen += item.entry.incomeFen;
+      total.expenseFen += item.entry.expenseFen;
+      total.balanceFen += item.entry.balanceFen;
+    }
+    totalByBucket.set(bucket, total);
+  }
+
+  const bySubcategory: Array<{ id: number; name: string; bucket: string; expenseFen: number }> = [];
+  for (const category of tree.categories) {
+    for (const sub of category.subcategories) {
+      for (const bucket of buckets.size > 0 ? buckets : new Set(["0"])) {
+        bySubcategory.push({
+          id: sub.id,
+          name: sub.name,
+          bucket,
+          expenseFen: subSums.get(`${bucket}|${sub.id}`) ?? 0,
+        });
+      }
+    }
+  }
+
+  return {
+    byCategory,
+    bySubcategory,
+    monthKeys: [...monthKeys].sort().reverse(),
+    totalByBucket,
+  };
 }
 
-async function sumBySubcategory(from: number | null, to: number | null): Promise<Map<number, number>> {
-  const where: string[] = ["type = 'expense'", "subcategory_id IS NOT NULL"];
-  const params: SqlValue[] = [];
-  if (typeof from === "number") {
-    where.push("occurred_at >= ?");
-    params.push(from);
-  }
-  if (typeof to === "number") {
-    where.push("occurred_at < ?");
-    params.push(to);
-  }
-  const rows = await query<{ subcategory_id: number; s: number }>(
-    `SELECT subcategory_id, SUM(amount_fen) AS s FROM records
-     WHERE ${where.join(" AND ")}
-     GROUP BY subcategory_id`,
-    params,
-  );
-  const map = new Map<number, number>();
-  for (const row of rows) map.set(Number(row.subcategory_id), Number(row.s ?? 0));
-  return map;
+function snapshotToSummary(
+  snapshot: Awaited<ReturnType<typeof snapshotFor>>,
+  bucket: string,
+  includeSubcategories: boolean,
+): OverallSummary {
+  const byCategory: CategorySummary[] = snapshot.byCategory
+    .filter((item) => item.bucket === bucket)
+    .map((item) => ({ id: item.id, ...item.entry }));
+
+  return {
+    total: snapshot.totalByBucket.get(bucket) ?? emptyBreakdown(),
+    byCategory,
+    bySubcategory: includeSubcategories
+      ? snapshot.bySubcategory
+          .filter((item) => item.bucket === bucket)
+          .map((item) => ({ id: item.id, name: item.name, expenseFen: item.expenseFen }))
+      : [],
+  };
+}
+
+/** 首页/详情页数据：1 条聚合 SQL 同时算「累计」和「指定区间」 */
+export async function loadDashboard(
+  from: number | null,
+  to: number | null,
+): Promise<{ cumulative: OverallSummary; month: OverallSummary; monthKeys: MonthKey[] }> {
+  const hasRange = typeof from === "number" && typeof to === "number";
+  const column = hasRange
+    ? `CASE WHEN occurred_at >= ${Number(from)} AND occurred_at < ${Number(to)} THEN '1' ELSE '0' END`
+    : "0";
+  const snapshot = await snapshotFor(from, to, column);
+  return {
+    cumulative: snapshotToSummary(snapshot, "0", true),
+    month: snapshotToSummary(snapshot, "1", true),
+    monthKeys: snapshot.monthKeys,
+  };
 }
 
 export async function summaryForRange(
@@ -251,45 +370,18 @@ export async function summaryForRange(
   to: number | null,
   options: { includeSubcategories?: boolean } = {},
 ): Promise<OverallSummary> {
-  const categories = await listCategories();
-  const sums = await sumByCategory(from, to);
-
-  const byCategory: CategorySummary[] = categories.map((category) => {
-    const entry = sums.get(category.id) ?? emptyBreakdown();
-    return { id: category.id, ...entry };
-  });
-
-  const total = byCategory.reduce<AmountBreakdown>((acc, item) => {
-    acc.incomeFen += item.incomeFen;
-    acc.expenseFen += item.expenseFen;
-    acc.balanceFen += item.balanceFen;
-    return acc;
-  }, emptyBreakdown());
-
-  let bySubcategory: SubcategorySummary[] = [];
-  if (options.includeSubcategories !== false) {
-    const subSums = await sumBySubcategory(from, to);
-    bySubcategory = categories
-      .flatMap((category) => category.subcategories)
-      .map((sub) => ({
-        id: sub.id,
-        name: sub.name,
-        expenseFen: subSums.get(sub.id) ?? 0,
-      }));
-  }
-
-  return { total, byCategory, bySubcategory };
+  const snapshot = await snapshotFor(from, to, "0");
+  return snapshotToSummary(snapshot, "0", options.includeSubcategories !== false);
 }
 
 /** 数据里出现过的月份，最新在前（用户可能补记历史记录，所以不能只列最近 12 个月） */
 export async function dataMonthKeys(limit = 240): Promise<MonthKey[]> {
-  const rows = await query<{ occurred_at: number }>(
-    "SELECT occurred_at FROM records ORDER BY occurred_at DESC LIMIT ?",
+  const rows = await query<{ month_key: string }>(
+    `SELECT DISTINCT to_char(to_timestamp(occurred_at / 1000.0), 'YYYY-MM') AS month_key
+       FROM records ORDER BY month_key DESC LIMIT ?`,
     [limit],
   );
-  const keys = new Set<MonthKey>();
-  for (const row of rows) keys.add(monthKeyOf(new Date(Number(row.occurred_at))));
-  return [...keys].sort().reverse();
+  return rows.map((row) => row.month_key as MonthKey);
 }
 
 /** ---------- 记录写入 ---------- */

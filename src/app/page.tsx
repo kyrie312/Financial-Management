@@ -1,24 +1,24 @@
 import { HomeClient } from "@/components/home-client";
 import { currentMonthKey, monthRange } from "@/lib/dates";
-import { listCategories, summaryForRange } from "@/lib/ledger";
+import { listCategories, loadDashboard } from "@/lib/ledger";
 
 export const dynamic = "force-dynamic";
 
 export default async function HomePage() {
-  const categories = await listCategories();
   const monthKey = currentMonthKey();
   const { start, end } = monthRange(monthKey);
 
-  const [cumulative, month] = await Promise.all([
-    summaryForRange(null, null, { includeSubcategories: false }),
-    summaryForRange(start, end, { includeSubcategories: false }),
+  // loadDashboard 用一条聚合 SQL 同时算出「累计」和「本月」；类别有进程内缓存
+  const [categories, dashboard] = await Promise.all([
+    listCategories(),
+    loadDashboard(start, end),
   ]);
 
   return (
     <HomeClient
       categories={categories}
-      cumulative={cumulative}
-      month={month}
+      cumulative={dashboard.cumulative}
+      month={dashboard.month}
       monthKey={monthKey}
       syncedAt={Date.now()}
     />

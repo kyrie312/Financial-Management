@@ -37,13 +37,19 @@ export interface RecordRow {
 }
 
 export function getDatabaseUrl(): string {
-  const url = process.env.DATABASE_URL?.trim();
-  if (!url) {
+  const raw = process.env.DATABASE_URL?.trim();
+  if (!raw) {
     throw new Error(
       "缺少 DATABASE_URL 环境变量。请在 .env.local（本机）或 Vercel 环境变量（线上）里配置 Supabase 连接串。",
     );
   }
-  return url;
+  // 给每条语句设一个明确的超时（秒）：宁可快速失败重试，也不要让连接被长时间占住
+  if (!/[?&]options=/.test(raw)) {
+    const timeoutSeconds = process.env.DATABASE_STATEMENT_TIMEOUT ?? "20";
+    const option = encodeURIComponent(`-c statement_timeout=${timeoutSeconds}s`);
+    return `${raw}${raw.includes("?") ? "&" : "?"}options=${option}`;
+  }
+  return raw;
 }
 
 const globalForDb = globalThis as unknown as {
@@ -52,13 +58,15 @@ const globalForDb = globalThis as unknown as {
 };
 
 function createClient(): Sql {
-  return postgres(getDatabaseUrl(), {
+  const client = postgres(getDatabaseUrl(), {
     // 连接池模式（PgBouncer transaction）不支持预处理语句
     prepare: false,
-    max: Number(process.env.DATABASE_POOL_MAX ?? 3),
-    idle_timeout: 20,
+    // 每次页面加载需要几个查询，池子留出余量，避免请求排队
+    max: Number(process.env.DATABASE_POOL_MAX ?? 6),
+    // 复用连接：跨太平洋建一次连接约 1 秒，尽量别重建
+    idle_timeout: 60,
     connect_timeout: 20,
-    max_lifetime: 60 * 10,
+    max_lifetime: 60 * 30,
     // bigint 一律按 JS number 处理（毫秒时间戳在安全整数范围内）
     types: {
       bigint: {
@@ -70,6 +78,41 @@ function createClient(): Sql {
     },
     onnotice: () => {},
   });
+
+  if (process.env.DB_DEBUG === "1") {
+    let active = 0;
+    let pending = 0;
+    const tag = `[db ${process.pid}]`;
+    client.unsafe = new Proxy(client.unsafe, {
+      apply(target, thisArg, args) {
+        active += 1;
+        pending += 1;
+        const started = Date.now();
+        const text = typeof args[0] === "string" ? args[0].slice(0, 60).replace(/\s+/g, " ") : "?";
+        if (pending > 6) console.log(`${tag} 查询排队 pending=${pending} active=${active} :: ${text}`);
+        const result = Reflect.apply(target, thisArg, args);
+        const settle = (label: string) => {
+          pending -= 1;
+          const ms = Date.now() - started;
+          if (ms > 1500 || label === "err") {
+            console.log(`${tag} ${label} ${ms}ms pending=${pending} :: ${text}`);
+          }
+          return result;
+        };
+        void Promise.resolve(result).then(
+          () => settle("ok"),
+          (error) => {
+            console.log(`${tag} 查询出错: ${error?.message}`);
+            settle("err");
+          },
+        );
+        return result;
+      },
+    });
+    console.log(`${tag} 已开启数据库诊断日志`);
+  }
+
+  return client;
 }
 
 export function getSql(): Sql {
